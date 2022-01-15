@@ -8,6 +8,8 @@ from progress.bar import Bar
 from lib.models.data_parallel import DataParallel
 from lib.utils.utils import AverageMeter
 
+from torch.cuda.amp import autocast as autocast
+from torch.cuda.amp import GradScaler as GradScaler
 
 class ModelWithLoss(torch.nn.Module):
   def __init__(self, model, loss):
@@ -42,6 +44,8 @@ class BaseTrainer(object):
           state[k] = v.to(device=device, non_blocking=True)
 
   def run_epoch(self, phase, epoch, data_loader):
+    scaler = GradScaler()
+    
     model_with_loss = self.model_with_loss
     if phase == 'train':
       model_with_loss.train()
@@ -52,6 +56,7 @@ class BaseTrainer(object):
       torch.cuda.empty_cache()
 
     opt = self.opt
+    print("using torch amp" if opt.amp else "disable torch amp")
     results = {}
     data_time, batch_time = AverageMeter(), AverageMeter()
     avg_loss_stats = {l: AverageMeter() for l in self.loss_stats}
@@ -65,13 +70,26 @@ class BaseTrainer(object):
 
       for k in batch:
         if k != 'meta':
-          batch[k] = batch[k].to(device=opt.device, non_blocking=True)    
-      output, loss, loss_stats = model_with_loss(batch)
-      loss = loss.mean()
-      if phase == 'train':
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+          batch[k] = batch[k].to(device=opt.device, non_blocking=True)
+      if opt.amp:            
+        ##* amp
+        with autocast():
+          output, loss, loss_stats = model_with_loss(batch)
+          loss = loss.mean() 
+        if phase == 'train':
+          self.optimizer.zero_grad()
+          scaler.scale(loss).backward()
+          scaler.step(self.optimizer)
+          scaler.update()
+      else:
+        #* original
+        output, loss, loss_stats = model_with_loss(batch)
+        loss = loss.mean()      
+        if phase == 'train':
+          self.optimizer.zero_grad()
+          loss.backward()
+          self.optimizer.step()
+      
       batch_time.update(time.time() - end)
       end = time.time()
 
